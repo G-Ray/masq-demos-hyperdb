@@ -1,9 +1,42 @@
 import React, { Component } from 'react'
 import './App.css'
-
+import swarm from 'webrtc-swarm'
+import signalhub from 'signalhub'
 import SearchBar from './components/SearchBar'
+import ram from 'random-access-memory'
+import hyperdb from 'hyperdb'
 
-import { Client } from 'masq-client'
+const hub = signalhub('swarm-example', ['localhost:8080'])
+const sw = swarm(hub)
+sw.on('peer', function (peer, id) {
+  console.log('connected to a new peer:', id)
+  console.log('total peers:', sw.peers.length)
+  console.log(peer)
+
+  peer.send(JSON.stringify({ cmd: 'requestDB' }))
+
+  peer.on('data', data => {
+    const json = JSON.parse(data)
+    console.log(json)
+    const cmd = json.cmd
+    if (cmd === 'key') {
+      console.log(json.key)
+      const db = hyperdb(ram, json.key)
+      db.on('ready', () =>
+        peer.send(JSON.stringify({ cmd: 'key', key: db.local.key.toString('hex') }))
+      )
+    }
+
+    if (cmd === 'succes') {
+      console.log('success, close all')
+    }
+  })
+})
+
+sw.on('disconnect', function (peer, id) {
+  console.log('disconnected from a peer:', id)
+  console.log('total peers:', sw.peers.length)
+})
 
 function ConnectionStatus ({ isConnected }) {
   return isConnected
@@ -18,72 +51,71 @@ class App extends Component {
       items: [],
       isConnected: false
     }
-    this.client = null
     this.onSearch = this.onSearch.bind(this)
   }
 
   async onSearch (query) {
     console.log('query:', query)
-    let occurences = (await this.client.getItem(query)) || 0
-    await this.client.setItem(query, occurences + 1)
-
-    if (occurences > 0) return
-    let items = this.state.items.slice()
-    items.push(query)
-    this.setState({
-      items: items
+    console.log(this.db)
+    this.db.put(query, 'ok', (err) => {
+      if (err) return console.error(err)
     })
   }
 
   async componentDidMount () {
-    const appInfo = {
-      url: 'https://masq.io/search',
-      name: 'Masq Search',
-      description: 'Simple search engine using qwant.com'
-    }
-    const settings = {
-      socketUrl: 'ws://localhost:8080',
-      socketConf: { requestTimeout: 0 }
-    }
+    const key = window.location.hash.substr(1)
+    const db = hyperdb(ram, key ? key : undefined)
+    this.db = db
+    window.db = db
+    const hub = signalhub('secret-swarm-id2', ['localhost:8080'])
 
-    try {
-      this.client = new Client(settings)
+    db.on('ready', () => {
+      const sw = swarm(hub)
+      console.log('key is', db.key.toString('hex'))
 
-      this.client.onSignIn(function (userId) {
-        console.log('onSignIn', userId)
-      })
-      // Register an events to be notifed when users sign out of Masq
-      this.client.onSignOut(function () {
-        console.log('onSignOut')
-      })
-
-      await this.client.init(appInfo)
-
-      this.setState({ isConnected: true })
-
-      this.client.ws.onopen(() => {
-        this.setState({ isConnected: true })
-      })
-      this.client.ws.onreopen(() => {
-        this.setState({ isConnected: true })
-      })
-      this.client.ws.onclose(() => {
-        this.setState({ isConnected: false })
+      let checkout = db.checkout()
+      db.watch('', () => {
+        console.log('folder has changed')
+        const diffStream = db.createDiffStream(checkout)
+        diffStream.on('close', () => console.log('diff closed'))
+        diffStream.on('end', () => {
+          console.log('diff destroy')
+          diffStream.destroy()
+          checkout = db.checkout()
+        })
+        diffStream.on('data', data => {
+          console.log('diff', data)
+          let items = this.state.items.slice()
+          items.push(data.left[0].key)
+          this.setState({ items })
+        })
       })
 
-      // Get Search history
-      const keys = (await this.client.listKeys())
-      this.setState({
-        items: keys
+      db.list((err, list) => {
+        if (err) return console.error(err)
+        console.log(list[0])
+        if (list[0]) {
+          const items = list[0].map(elem => elem.key)
+          console.log('items', items)
+          this.setState({
+            items: items
+          })
+        }
       })
 
-      console.log('keys:', keys)
-    } catch (err) {
-      if (err.status === 403) {
-        window.localStorage.removeItem('token')
-      }
-      console.error(err)
-    }
+      sw.on('peer', function (peer, id) {
+        console.log('connected to a new peer:', id)
+        console.log('total peers:', sw.peers.length)
+        console.log(peer)
+        const stream = db.replicate({ live: true })
+        peer.pipe(stream).pipe(peer)
+      })
+
+      sw.on('disconnect', function (peer, id) {
+        console.log('disconnected from a peer:', id)
+        console.log('total peers:', sw.peers.length)
+      })
+    })
   }
 
   render () {
